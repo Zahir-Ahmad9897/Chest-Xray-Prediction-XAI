@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🫁 Chest X-Ray Pneumonia XAI Dashboard
+#  Chest X-Ray Pneumonia XAI Dashboard
 
 **An interactive web dashboard for Chest X-Ray Pneumonia classification with 5 Explainable AI (XAI) methods.**
 
