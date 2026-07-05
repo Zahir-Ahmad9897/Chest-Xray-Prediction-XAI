@@ -1,0 +1,13 @@
+fastapi>=0.104.0
+uvicorn>=0.24.0
+torch>=2.0
+torchvision>=0.15
+captum>=0.6
+lime>=0.2.0.1
+shap>=0.43
+opencv-python-headless>=4.8
+gdown>=4.7
+Pillow>=10.0
+scikit-image>=0.22
+numpy>=1.24
+scipy>=1.11
