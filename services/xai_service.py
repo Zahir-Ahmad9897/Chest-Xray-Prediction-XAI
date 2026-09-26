@@ -1,56 +1,55 @@
 """
 XAI service — Grad-CAM, Grad-CAM++, LIME, SHAP, Integrated Gradients.
-
-Grad-CAM uses torch.autograd.grad() instead of register_full_backward_hook
-to avoid PyTorch 2.x BackwardHookFunctionBackward caching bugs.
 """
 
-import logging, gc, torch, torch.nn as nn, torch.nn.functional as F
-import numpy as np, cv2
+import base64
+import gc
+import io
+import logging
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
 
 from config import (
-    GRADCAM_TARGET_LAYER, SHAP_BACKGROUND_SIZE, SHAP_NSAMPLES,
-    LIME_NUM_SAMPLES, LIME_NUM_FEATURES, LIME_NUM_RUNS,
-    IG_STEPS, IMG_SIZE, IMAGENET_MEAN, IMAGENET_STD, CLASS_NAMES,
+    CLASS_NAMES, GRADCAM_TARGET_LAYER, IG_STEPS, IMAGENET_MEAN, IMAGENET_STD,
+    IMG_SIZE, LIME_NUM_FEATURES, LIME_NUM_RUNS, LIME_NUM_SAMPLES,
+    SHAP_NSAMPLES,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Helpers ────────────────────────────────────────────────────────────
 
 def _overlay_heatmap(image_np, heatmap, alpha=0.4, colormap=cv2.COLORMAP_JET):
     h, w = image_np.shape[:2]
-    hm = cv2.resize(heatmap, (w, h))
+    hm = cv2.resize(np.nan_to_num(heatmap, nan=0.0), (w, h))
     hm8 = np.ascontiguousarray(np.clip(hm * 255, 0, 255).astype(np.uint8))
-    color = cv2.applyColorMap(hm8, colormap)
-    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB) / 255.0
+    color = cv2.cvtColor(cv2.applyColorMap(hm8, colormap), cv2.COLOR_BGR2RGB) / 255.0
     return np.clip((1 - alpha) * image_np + alpha * color, 0, 1)
 
 
 def _denormalize(tensor):
-    m = torch.tensor(IMAGENET_MEAN).view(3, 1, 1).to(tensor.device)
-    s = torch.tensor(IMAGENET_STD).view(3, 1, 1).to(tensor.device)
+    m = torch.tensor(IMAGENET_MEAN, device=tensor.device).view(3, 1, 1)
+    s = torch.tensor(IMAGENET_STD, device=tensor.device).view(3, 1, 1)
     return tensor * s + m
 
 
 def _tensor_to_b64(arr):
-    """uint8 RGB numpy array → base64 JPEG string."""
-    import base64, io
-    from PIL import Image
-    img = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+    image = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    image.save(buf, format="JPEG", quality=90, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
-# ── Grad-CAM (autograd.grad — no backward hooks) ──────────────────────
+def _normalize(array):
+    array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    low, high = array.min(), array.max()
+    return (array - low) / (high - low) if high > low else np.zeros_like(array)
+
 
 class _GradCAMBase:
-    """
-    Base class for Grad-CAM / Grad-CAM++.
-    Uses torch.autograd.grad() instead of register_full_backward_hook.
-    Each call to generate() is fully self-contained.
-    """
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
@@ -60,204 +59,110 @@ class _GradCAMBase:
         activation_holder = {}
 
         def _capture(module, inp, out):
-            activation_holder["val"] = out  # NOT .detach()
+            activation_holder["val"] = out
 
         handle = self.target_layer.register_forward_hook(_capture)
         try:
             output = self.model(input_tensor.to(device))
-            if target_class is None:
-                target_class = int(torch.sigmoid(output).item() >= 0.5)
-            one_hot = torch.zeros_like(output)
-            one_hot[0, 0] = 1.0 if target_class == 1 else -1.0
-            grads = torch.autograd.grad(
-                outputs=output,
-                inputs=activation_holder["val"],
-                grad_outputs=one_hot,
-            )[0]
+            one_hot = torch.ones_like(output) if target_class == 1 else -torch.ones_like(output)
+            grads = torch.autograd.grad(output, activation_holder["val"], grad_outputs=one_hot)[0]
         finally:
             handle.remove()
+        return grads, activation_holder["val"].detach()
 
-        acts = activation_holder["val"].detach()
-        return grads, acts, target_class
-
-    def _normalize(self, cam_np):
-        if cam_np.max() > cam_np.min():
-            return (cam_np - cam_np.min()) / (cam_np.max() - cam_np.min())
-        return np.zeros_like(cam_np)
+    @staticmethod
+    def _normalize(cam_np):
+        return _normalize(cam_np)
 
 
 class GradCAM(_GradCAMBase):
-    def generate(self, input_tensor, target_class=None, device=None):
-        device = device or next(self.model.parameters()).device
-        grads, acts, tc = self._compute_cam(input_tensor, target_class, device)
+    def generate(self, input_tensor, target_class, device):
+        grads, acts = self._compute_cam(input_tensor, target_class, device)
         weights = grads.mean(dim=(2, 3), keepdim=True)
-        cam = F.relu((weights * acts).sum(dim=1, keepdim=True))
-        cam_np = cam.squeeze().cpu().numpy()
-        return self._normalize(cam_np)
+        return self._normalize(F.relu((weights * acts).sum(dim=1, keepdim=True)).squeeze().cpu().numpy())
 
 
 class GradCAMPlusPlus(_GradCAMBase):
-    def generate(self, input_tensor, target_class=None, device=None):
-        device = device or next(self.model.parameters()).device
-        grads, acts, tc = self._compute_cam(input_tensor, target_class, device)
+    def generate(self, input_tensor, target_class, device):
+        grads, acts = self._compute_cam(input_tensor, target_class, device)
         g2, g3 = grads ** 2, grads ** 3
         alpha = g2 / (2.0 * g2 + (acts * g3).sum(dim=(2, 3), keepdim=True) + 1e-8)
         weights = (alpha * F.relu(grads)).sum(dim=(2, 3), keepdim=True)
-        cam = F.relu((weights * acts).sum(dim=1, keepdim=True))
-        cam_np = cam.squeeze().cpu().numpy()
-        return self._normalize(cam_np)
+        return self._normalize(F.relu((weights * acts).sum(dim=1, keepdim=True)).squeeze().cpu().numpy())
 
 
-# ── LIME ───────────────────────────────────────────────────────────────
-
-def _run_lime(model, input_tensor, image_np_uint8, device, n_samples=None,
-              n_features=None, n_runs=None):
+def _run_lime(model, image_np_uint8, device):
     from lime import lime_image
     from skimage.segmentation import slic, mark_boundaries
 
-    n_samples = n_samples or LIME_NUM_SAMPLES
-    n_features = n_features or LIME_NUM_FEATURES
-    n_runs = n_runs or LIME_NUM_RUNS
-
-    def _predict_fn(images):
+    def predict_fn(images):
         t = torch.from_numpy(images).permute(0, 3, 1, 2).float().to(device)
-        m = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1).to(device)
-        s = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1).to(device)
-        t = (t / 255.0 - m) / s
-        with torch.no_grad():
-            p = torch.sigmoid(model(t)).cpu().numpy().flatten()
+        mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+        with torch.inference_mode():
+            p = torch.sigmoid(model((t / 255.0 - mean) / std)).cpu().numpy().reshape(-1)
         return np.column_stack([1 - p, p])
 
     explainer = lime_image.LimeImageExplainer()
-    seg_fn = lambda x: slic(x, n_segments=50, compactness=10, sigma=1)
-
     exp = explainer.explain_instance(
-        image_np_uint8, _predict_fn,
-        top_labels=2, hide_color=0, num_samples=n_samples,
-        segmentation_fn=seg_fn,
+        image_np_uint8, predict_fn, top_labels=2, hide_color=0,
+        num_samples=LIME_NUM_SAMPLES,
+        segmentation_fn=lambda x: slic(x, n_segments=50, compactness=10, sigma=1),
     )
     top = exp.top_labels[0]
-    temp, mask = exp.get_image_and_mask(top, positive_only=True,
-                                        num_features=n_features, hide_rest=False)
-    overlay = mark_boundaries(temp / 255.0, mask)
-    return np.clip(overlay * 255, 0, 255).astype(np.uint8)
+    temp, mask = exp.get_image_and_mask(top, positive_only=True, num_features=LIME_NUM_FEATURES, hide_rest=False)
+    return np.clip(mark_boundaries(temp / 255.0, mask), 0, 1)
 
-
-# ── SHAP ───────────────────────────────────────────────────────────────
 
 def _run_shap(shap_explainer, input_tensor, device):
-    sv = shap_explainer.shap_values(input_tensor.to(device), nsamples=SHAP_NSAMPLES)
-    if isinstance(sv, list):
-        sv_np = np.abs(sv[0][0]).mean(axis=0)
-    else:
-        sv_np = np.abs(sv[0]).mean(axis=0)
-    sv_np = np.squeeze(sv_np)
-    if sv_np.max() > sv_np.min():
-        sv_np = (sv_np - sv_np.min()) / (sv_np.max() - sv_np.min())
-    return sv_np
+    values = shap_explainer.shap_values(input_tensor.to(device), nsamples=SHAP_NSAMPLES)
+    values = values[0] if isinstance(values, list) else values
+    return _normalize(np.abs(np.asarray(values[0])).mean(axis=0).squeeze())
 
-
-# ── Integrated Gradients (Captum) ─────────────────────────────────────
 
 def _run_ig(ig, input_tensor, target_class, device):
-    input_tensor = input_tensor.to(device)
-    
-    # The model has a single output node, so target index must always be 0
-    attr = ig.attribute(input_tensor, target=0, n_steps=IG_STEPS)
-    
-    # If the prediction is Normal (0), invert attributions so the heatmap
-    # highlights areas pushing the prediction towards Normal instead of Pneumonia.
+    attr = ig.attribute(input_tensor.to(device), target=0, n_steps=IG_STEPS)
     if target_class == 0:
         attr = -attr
-
-    attr_np = np.array(attr.detach().cpu(), dtype=np.float64)
-    # Captum returns (1, 3, H, W) → reduce to (H, W)
-    if attr_np.ndim == 4:
-        attr_np = attr_np[0].mean(axis=0)
-    elif attr_np.ndim == 3:
-        if attr_np.shape[0] == 3:
-            attr_np = attr_np.mean(axis=0)
-        elif attr_np.shape[2] == 3:
-            attr_np = attr_np.mean(axis=2)
-    attr_np = np.squeeze(attr_np)
-    if attr_np.max() > attr_np.min():
-        attr_np = (attr_np - attr_np.min()) / (attr_np.max() - attr_np.min())
-    return attr_np
+    return _normalize(attr.detach().cpu().numpy()[0].mean(axis=0))
 
 
-# ── Dispatcher ─────────────────────────────────────────────────────────
+def run_xai(model, input_tensor, methods: list, device, shap_explainer=None, ig_instance=None, train_dataset=None):
+    img_np = np.clip(_denormalize(input_tensor.squeeze().cpu()).permute(1, 2, 0).numpy(), 0, 1)
+    image_uint8 = (img_np * 255).astype(np.uint8)
+    with torch.inference_mode():
+        probability = float(torch.sigmoid(model(input_tensor.to(device)).reshape(-1)[0]).item())
+    target_class = int(probability >= 0.5)
 
-def run_xai(model, input_tensor, methods: list, device, shap_explainer=None,
-             ig_instance=None, train_dataset=None):
-    """
-    Run selected XAI methods. Returns dict of {method_name: base64_image}.
-
-    Args:
-        model: DenseNet-121 model (eval mode).
-        input_tensor: (1, 3, H, W) preprocessed tensor.
-        methods: list like ["gradcam", "gradcam_pp", "lime", "shap", "ig"].
-        device: torch.device.
-        shap_explainer: pre-built shap.GradientExplainer (or None to skip SHAP).
-        ig_instance: pre-built Captum IntegratedGradients (or None to skip IG).
-        train_dataset: needed to build SHAP explainer on the fly.
-    """
-    # Denormalized image for overlay
-    img_np = _denormalize(input_tensor.squeeze().cpu()).permute(1, 2, 0).numpy()
-    image_uint8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
-
-    # Determine target class from model prediction
-    with torch.no_grad():
-        logit = model(input_tensor.to(device)).item()
-    prob = 1.0 / (1.0 + np.exp(-logit))
-    target_class = int(prob >= 0.5)
-
-    # Get target layer
-    parts = GRADCAM_TARGET_LAYER.split(".")
     target_layer = model
-    for p in parts:
-        target_layer = getattr(target_layer, p)
+    for part in GRADCAM_TARGET_LAYER.split("."):
+        target_layer = getattr(target_layer, part)
 
     results = {}
-
     for method in methods:
         try:
             if method == "gradcam":
-                gcam = GradCAM(model, target_layer)
-                heatmap = gcam.generate(input_tensor, target_class, device)
-                overlay = _overlay_heatmap(img_np, heatmap)
-                results["gradcam"] = _tensor_to_b64(overlay)
-
+                heatmap = GradCAM(model, target_layer).generate(input_tensor, target_class, device)
+                results[method] = _tensor_to_b64(_overlay_heatmap(img_np, heatmap))
             elif method == "gradcam_pp":
-                gcpp = GradCAMPlusPlus(model, target_layer)
-                heatmap = gcpp.generate(input_tensor, target_class, device)
-                overlay = _overlay_heatmap(img_np, heatmap, colormap=cv2.COLORMAP_VIRIDIS)
-                results["gradcam_pp"] = _tensor_to_b64(overlay)
-
+                heatmap = GradCAMPlusPlus(model, target_layer).generate(input_tensor, target_class, device)
+                results[method] = _tensor_to_b64(_overlay_heatmap(img_np, heatmap, colormap=cv2.COLORMAP_VIRIDIS))
             elif method == "lime":
-                lime_img = _run_lime(model, input_tensor, image_uint8, device)
-                results["lime"] = _tensor_to_b64(lime_img)
-
+                results[method] = _tensor_to_b64(_run_lime(model, image_uint8, device))
             elif method == "shap":
                 if shap_explainer is None:
                     raise ValueError("SHAP explainer not initialized")
-                shap_map = _run_shap(shap_explainer, input_tensor, device)
-                overlay = _overlay_heatmap(img_np, shap_map, colormap=cv2.COLORMAP_BONE)
-                results["shap"] = _tensor_to_b64(overlay)
-
+                results[method] = _tensor_to_b64(_overlay_heatmap(img_np, _run_shap(shap_explainer, input_tensor, device), colormap=cv2.COLORMAP_BONE))
             elif method == "ig":
                 if ig_instance is None:
                     raise ValueError("IG instance not initialized")
-                ig_map = _run_ig(ig_instance, input_tensor, target_class, device)
-                overlay = _overlay_heatmap(img_np, ig_map, colormap=cv2.COLORMAP_VIRIDIS)
-                results["ig"] = _tensor_to_b64(overlay)
-
-        except Exception as e:
-            logger.error("XAI %s failed: %s", method, e)
+                results[method] = _tensor_to_b64(_overlay_heatmap(img_np, _run_ig(ig_instance, input_tensor, target_class, device), colormap=cv2.COLORMAP_VIRIDIS))
+        except Exception:
+            logger.exception("XAI %s failed", method)
             results[method] = None
 
-    # Free GPU memory
     del input_tensor
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
-
     return results

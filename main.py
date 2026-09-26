@@ -2,105 +2,111 @@
 FastAPI application for Chest X-Ray Pneumonia XAI Dashboard.
 """
 
-import os, io, logging, gc, torch
+import asyncio
+import io
+import logging
+import os
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+
+import torch
+from captum.attr import IntegratedGradients
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageFile, UnidentifiedImageError
 
-from config import CLASS_NAMES, SHAP_BACKGROUND_SIZE, SHAP_NSAMPLES
+from config import (
+    ALLOWED_IMAGE_TYPES, ALLOWED_XAI_METHODS, MAX_IMAGE_BYTES,
+    MAX_IMAGE_PIXELS, MAX_XAI_METHODS, MIN_IMAGE_DIMENSION,
+    MODEL_SETUP_TOKEN, SHAP_BACKGROUND_SIZE, SHAP_NSAMPLES,
+)
 from services import model_service, xai_service
-from captum.attr import IntegratedGradients
 
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+ImageFile.LOAD_TRUNCATED_IMAGES = False
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Chest X-Ray Pneumonia XAI", version="2.0.0")
-
-# Serve static files
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = None
 shap_explainer = None
 ig_instance = None
-
-# Input guardrails. These prevent accidental uploads and unbounded memory use.
-MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", 10 * 1024 * 1024))
-MIN_IMAGE_DIMENSION = int(os.environ.get("MIN_IMAGE_DIMENSION", 100))
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png"}
+inference_lock = asyncio.Lock()
 
 
 def _validate_image(contents: bytes, content_type: Optional[str]) -> None:
-    """Validate an uploaded image before it reaches the model pipeline."""
     if not contents:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty")
-
+        raise HTTPException(400, "The uploaded file is empty")
     if len(contents) > MAX_IMAGE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Image is too large; maximum size is {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
-        )
-
+        raise HTTPException(413, "Image exceeds the maximum allowed size")
     if content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported image type; upload a JPEG or PNG chest X-ray",
-        )
-
+        raise HTTPException(415, "Unsupported image type; upload a JPEG or PNG")
     try:
-        # verify() checks the file structure without decoding the entire image.
         with Image.open(io.BytesIO(contents)) as image:
             image.verify()
-
-        # Reopen after verify(); verify() invalidates the image object.
         with Image.open(io.BytesIO(contents)) as image:
+            if image.format not in {"JPEG", "PNG"}:
+                raise HTTPException(415, "The file content is not a JPEG or PNG")
             if image.width < MIN_IMAGE_DIMENSION or image.height < MIN_IMAGE_DIMENSION:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Image dimensions must be at least {MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION} pixels",
-                )
+                raise HTTPException(400, "Image dimensions are too small")
     except HTTPException:
         raise
-    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, SyntaxError) as exc:
         logger.info("Rejected invalid image upload: %s", exc)
-        raise HTTPException(status_code=400, detail="The uploaded file is not a valid JPEG or PNG image") from exc
+        raise HTTPException(400, "The uploaded file is not a valid JPEG or PNG image") from exc
 
 
-# ── Startup ───────────────────────────────────────────────────────────
+async def _read_upload(file: UploadFile) -> bytes:
+    if file.size is not None and file.size > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image exceeds the maximum allowed size")
+    contents = await file.read(MAX_IMAGE_BYTES + 1)
+    _validate_image(contents, file.content_type)
+    return contents
+
+
+def _validate_methods(methods: str) -> list[str]:
+    method_list = list(dict.fromkeys(m.strip().lower() for m in methods.split(",") if m.strip()))
+    unknown = sorted(set(method_list) - ALLOWED_XAI_METHODS)
+    if unknown:
+        raise HTTPException(400, f"Unsupported XAI method(s): {', '.join(unknown)}")
+    if not method_list:
+        raise HTTPException(400, "At least one XAI method is required")
+    if len(method_list) > MAX_XAI_METHODS:
+        raise HTTPException(400, f"Select at most {MAX_XAI_METHODS} XAI methods per request")
+    return method_list
+
+
+def _check_setup_token(token: Optional[str]) -> None:
+    if not MODEL_SETUP_TOKEN:
+        raise HTTPException(503, "Model download is disabled until MODEL_SETUP_TOKEN is configured")
+    if token != MODEL_SETUP_TOKEN:
+        raise HTTPException(401, "Invalid model setup token")
+
+
 @app.on_event("startup")
 async def startup():
-    global model, shap_explainer, ig_instance
+    global model, ig_instance
     logger.info("Loading model on %s …", DEVICE)
-    model = model_service.load_model(DEVICE)
-    model.to(DEVICE)
-
-    # Captum IG
+    model = model_service.load_model(DEVICE).to(DEVICE)
     ig_instance = IntegratedGradients(model)
 
-    logger.info("Ready. SHAP explainer will be built on first /api/explain call "
-                "using uploaded background samples.")
 
-
-def _build_shap_explainer(train_loader=None):
-    """Build SHAP GradientExplainer. Called lazily or after model download."""
+def _build_shap_explainer():
     global shap_explainer
-    if shap_explainer is not None:
-        return shap_explainer
-    import shap
-    # Use a blurred background as fallback
-    bg = torch.zeros(1, 3, 224, 224, device=DEVICE)
-    bg[0, 0] = 0.485; bg[0, 1] = 0.456; bg[0, 2] = 0.406
-    shap_explainer = shap.GradientExplainer(model, bg)
+    if shap_explainer is None:
+        import shap
+        bg = torch.zeros(SHAP_BACKGROUND_SIZE, 3, 224, 224, device=DEVICE)
+        bg[:, 0] = 0.485; bg[:, 1] = 0.456; bg[:, 2] = 0.406
+        shap_explainer = shap.GradientExplainer(model, bg)
     return shap_explainer
 
 
-# ── Routes ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
-    with open(html_path, "r") as f:
+    with open(os.path.join(os.path.dirname(__file__), "templates", "index.html"), encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 
@@ -113,64 +119,43 @@ async def health():
 async def predict(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(503, "Model not loaded")
-    contents = await file.read()
-    _validate_image(contents, file.content_type)
-    tensor = model_service.preprocess_image(contents)
-    result = model_service.predict(model, tensor, DEVICE)
-    return JSONResponse(result)
+    contents = await _read_upload(file)
+    async with inference_lock:
+        return JSONResponse(model_service.predict(model, model_service.preprocess_image(contents), DEVICE))
 
 
 @app.post("/api/explain")
-async def explain(
-    file: UploadFile = File(...),
-    methods: str = Query("gradcam,gradcam_pp,lime,shap,ig"),
-):
+async def explain(file: UploadFile = File(...), methods: str = Query("gradcam,gradcam_pp,ig")):
     if model is None:
         raise HTTPException(503, "Model not loaded")
-
-    contents = await file.read()
-    _validate_image(contents, file.content_type)
-    tensor = model_service.preprocess_image(contents)
-
-    # Parse requested methods
-    method_list = [m.strip() for m in methods.split(",") if m.strip()]
-
-    # Ensure SHAP explainer exists
-    if "shap" in method_list and shap_explainer is None:
-        _build_shap_explainer()
-
-    # Get prediction
-    pred = model_service.predict(model, tensor, DEVICE)
-
-    # Run XAI
-    xai_results = xai_service.run_xai(
-        model=model,
-        input_tensor=tensor,
-        methods=method_list,
-        device=DEVICE,
-        shap_explainer=shap_explainer,
-        ig_instance=ig_instance,
-    )
-
-    return JSONResponse({
-        "prediction": pred,
-        "explanations": xai_results,
-    })
+    contents = await _read_upload(file)
+    method_list = _validate_methods(methods)
+    async with inference_lock:
+        tensor = model_service.preprocess_image(contents)
+        if "shap" in method_list:
+            _build_shap_explainer()
+        pred = model_service.predict(model, tensor, DEVICE)
+        xai_results = xai_service.run_xai(model, tensor, method_list, DEVICE, shap_explainer, ig_instance)
+    return JSONResponse({"prediction": pred, "explanations": xai_results})
 
 
 @app.post("/api/setup/download-model")
-async def download_model():
-    """Download model from Google Drive."""
+async def download_model(x_setup_token: Optional[str] = Header(default=None)):
+    _check_setup_token(x_setup_token)
     try:
-        path = model_service.download_model_from_drive()
-        # Reload
-        global model, ig_instance
-        model = model_service.load_model(DEVICE)
-        model.to(DEVICE)
-        ig_instance = IntegratedGradients(model)
+        global model, ig_instance, shap_explainer
+        async with inference_lock:
+            path = model_service.download_model_from_drive()
+            model_service._model_cache = None
+            model = model_service.load_model(DEVICE).to(DEVICE)
+            ig_instance = IntegratedGradients(model)
+            shap_explainer = None
         return {"status": "ok", "model_path": path}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Model download failed")
+        raise HTTPException(500, "Model download failed")
 
 
 if __name__ == "__main__":

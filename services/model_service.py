@@ -2,25 +2,28 @@
 Model service — loads DenseNet-121, preprocesses images, runs inference.
 """
 
-import os, logging, torch, torch.nn as nn, torch.nn.functional as F
-import torchvision.models as models
-from torchvision.models import DenseNet121_Weights
-from torchvision import transforms
-from PIL import Image
-import numpy as np
+import hashlib
+import logging
+import os
+import io
+
 import gdown
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from PIL import Image
+from torchvision import transforms
+from torchvision.models import DenseNet121_Weights
 
 from config import (
-    MODEL_PATH, MODEL_DIR, GOOGLE_DRIVE_MODEL_URL,
-    IMG_SIZE, IMAGENET_MEAN, IMAGENET_STD,
+    CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD, IMG_SIZE, MODEL_DIR,
+    MODEL_PATH, MODEL_SHA256, GOOGLE_DRIVE_MODEL_URL, PREDICTION_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
-
 _model_cache = None
-
-
-# ── DenseNet inplace-ReLU patch ────────────────────────────────────────
 _original_densenet_forward = None
 
 
@@ -29,8 +32,7 @@ def _patched_densenet_forward(self, x):
     out = F.relu(features, inplace=False)
     out = F.adaptive_avg_pool2d(out, (1, 1))
     out = torch.flatten(out, 1)
-    out = self.classifier(out)
-    return out
+    return self.classifier(out)
 
 
 def _apply_patch():
@@ -42,7 +44,6 @@ def _apply_patch():
         logger.info("Patched DenseNet.forward: inplace=True -> inplace=False")
 
 
-# ── Model builder ──────────────────────────────────────────────────────
 def _build_model() -> nn.Module:
     model = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
     num_f = model.classifier.in_features
@@ -50,32 +51,40 @@ def _build_model() -> nn.Module:
     return model
 
 
-# ── Download from Google Drive ─────────────────────────────────────────
+def _verify_checksum(path: str) -> None:
+    if not MODEL_SHA256:
+        logger.warning("MODEL_SHA256 is not configured; downloaded weights are not checksum-pinned")
+        return
+    digest = hashlib.sha256()
+    with open(path, "rb") as model_file:
+        for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest().lower() != MODEL_SHA256:
+        raise RuntimeError("Downloaded model checksum does not match MODEL_SHA256")
+
+
 def download_model_from_drive(url: str = GOOGLE_DRIVE_MODEL_URL) -> str:
     os.makedirs(MODEL_DIR, exist_ok=True)
     if os.path.exists(MODEL_PATH):
-        logger.info("Model already exists at %s", MODEL_PATH)
+        _verify_checksum(MODEL_PATH)
         return MODEL_PATH
+
     logger.info("Downloading model from Google Drive …")
-    # gdown handles folders by finding .pt files inside
     gdown.download_folder(url, output=MODEL_DIR, quiet=False)
-    # find the .pt/.pth file — prioritize files with "best" in the name
-    candidates = [f for f in os.listdir(MODEL_DIR)
-                  if f.endswith((".pt", ".pth")) and f != "best.pt"]
+    candidates = [
+        f for f in os.listdir(MODEL_DIR)
+        if f.endswith((".pt", ".pth")) and f != "best.pt"
+    ]
     candidates.sort(key=lambda f: ("best" not in f.lower(), f))
-    for f in candidates:
-        os.replace(os.path.join(MODEL_DIR, f), MODEL_PATH)
-        logger.info("Renamed %s → best.pt", f)
+    for filename in candidates:
+        os.replace(os.path.join(MODEL_DIR, filename), MODEL_PATH)
         break
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"No .pt/.pth found in {MODEL_DIR} after download"
-        )
-    logger.info("Model saved to %s", MODEL_PATH)
+        raise FileNotFoundError(f"No .pt/.pth found in {MODEL_DIR} after download")
+    _verify_checksum(MODEL_PATH)
     return MODEL_PATH
 
 
-# ── Load / cache ───────────────────────────────────────────────────────
 def load_model(device: torch.device = None) -> nn.Module:
     global _model_cache
     if _model_cache is not None:
@@ -83,24 +92,24 @@ def load_model(device: torch.device = None) -> nn.Module:
 
     _apply_patch()
     model = _build_model()
+    ckpt_path = MODEL_PATH if os.path.exists(MODEL_PATH) else download_model_from_drive()
+    _verify_checksum(ckpt_path)
 
-    ckpt_path = MODEL_PATH
-    if not os.path.exists(ckpt_path):
-        ckpt_path = download_model_from_drive()
-
-    ckpt = torch.load(ckpt_path, map_location=device or "cpu", weights_only=False)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
-
+    # weights_only=True avoids arbitrary-code execution from untrusted checkpoints.
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device or "cpu", weights_only=True)
+    except (TypeError, RuntimeError) as exc:
+        raise RuntimeError("Model checkpoint must be a tensor state dict") from exc
+    state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    if not isinstance(state_dict, dict):
+        raise RuntimeError("Model checkpoint has an unsupported format")
+    model.load_state_dict(state_dict)
     model.eval()
     _model_cache = model
     logger.info("Model loaded from %s", ckpt_path)
     return model
 
 
-# ── Preprocessing ──────────────────────────────────────────────────────
 _transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -109,19 +118,22 @@ _transform = transforms.Compose([
 
 
 def preprocess_image(file_bytes: bytes) -> torch.Tensor:
-    img = Image.open(__import__("io").BytesIO(file_bytes)).convert("RGB")
-    # Handle grayscale: replicate to 3 channels
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return _transform(img).unsqueeze(0)  # (1, 3, H, W)
+    with Image.open(io.BytesIO(file_bytes)) as image:
+        image = image.convert("RGB")
+        return _transform(image).unsqueeze(0)
 
 
-# ── Predict ────────────────────────────────────────────────────────────
 def predict(model: nn.Module, tensor: torch.Tensor, device: torch.device):
     tensor = tensor.to(device)
-    with torch.no_grad():
-        logit = model(tensor).item()
-    prob = 1.0 / (1.0 + np.exp(-logit))
-    label_idx = int(prob >= 0.5)
-    return {"label": label_idx, "label_name": ["NORMAL", "PNEUMONIA"][label_idx],
-            "probability": float(prob), "logit": float(logit)}
+    with torch.inference_mode():
+        logit = float(model(tensor).reshape(-1)[0].item())
+    # Stable sigmoid avoids overflow for extreme logits.
+    probability = float(torch.sigmoid(torch.tensor(logit)).item())
+    label_idx = int(probability >= PREDICTION_THRESHOLD)
+    return {
+        "label": label_idx,
+        "label_name": CLASS_NAMES[label_idx],
+        "probability": probability,
+        "threshold": PREDICTION_THRESHOLD,
+        "logit": logit,
+    }
