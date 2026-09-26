@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageFile, UnidentifiedImageError
 
 from config import CLASS_NAMES, SHAP_BACKGROUND_SIZE, SHAP_NSAMPLES
 from services import model_service, xai_service
@@ -24,6 +25,47 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = None
 shap_explainer = None
 ig_instance = None
+
+# Input guardrails. These prevent accidental uploads and unbounded memory use.
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", 10 * 1024 * 1024))
+MIN_IMAGE_DIMENSION = int(os.environ.get("MIN_IMAGE_DIMENSION", 100))
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png"}
+
+
+def _validate_image(contents: bytes, content_type: Optional[str]) -> None:
+    """Validate an uploaded image before it reaches the model pipeline."""
+    if not contents:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
+
+    if len(contents) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image is too large; maximum size is {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
+        )
+
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported image type; upload a JPEG or PNG chest X-ray",
+        )
+
+    try:
+        # verify() checks the file structure without decoding the entire image.
+        with Image.open(io.BytesIO(contents)) as image:
+            image.verify()
+
+        # Reopen after verify(); verify() invalidates the image object.
+        with Image.open(io.BytesIO(contents)) as image:
+            if image.width < MIN_IMAGE_DIMENSION or image.height < MIN_IMAGE_DIMENSION:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Image dimensions must be at least {MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION} pixels",
+                )
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+        logger.info("Rejected invalid image upload: %s", exc)
+        raise HTTPException(status_code=400, detail="The uploaded file is not a valid JPEG or PNG image") from exc
 
 
 # ── Startup ───────────────────────────────────────────────────────────
@@ -72,6 +114,7 @@ async def predict(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(503, "Model not loaded")
     contents = await file.read()
+    _validate_image(contents, file.content_type)
     tensor = model_service.preprocess_image(contents)
     result = model_service.predict(model, tensor, DEVICE)
     return JSONResponse(result)
@@ -86,6 +129,7 @@ async def explain(
         raise HTTPException(503, "Model not loaded")
 
     contents = await file.read()
+    _validate_image(contents, file.content_type)
     tensor = model_service.preprocess_image(contents)
 
     # Parse requested methods
